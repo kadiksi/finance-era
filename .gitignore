@@ -1,0 +1,7 @@
+.env
+service-account.json
+*.pyc
+__pycache__/
+.venv/
+venv/
+.DS_Store

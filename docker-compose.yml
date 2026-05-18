@@ -1,0 +1,9 @@
+services:
+  finance-bot:
+    build: .
+    container_name: finance-bot
+    env_file:
+      - .env
+    volumes:
+      - ./service-account.json:/app/service-account.json:ro
+    restart: unless-stopped

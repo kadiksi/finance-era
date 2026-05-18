@@ -1,0 +1,54 @@
+import os
+from dataclasses import dataclass
+
+from dotenv import load_dotenv
+
+
+@dataclass(frozen=True, slots=True)
+class Config:
+    bot_token: str
+    google_sheet_id: str
+    google_credentials_file: str
+    timezone: str
+    allowed_user_ids: frozenset[int]
+
+
+def _parse_allowed_user_ids(value: str) -> frozenset[int]:
+    if not value.strip():
+        return frozenset()
+
+    user_ids: set[int] = set()
+    for raw_user_id in value.split(","):
+        raw_user_id = raw_user_id.strip()
+        if raw_user_id:
+            user_ids.add(int(raw_user_id))
+    return frozenset(user_ids)
+
+
+def load_config() -> Config:
+    load_dotenv()
+
+    bot_token = os.getenv("BOT_TOKEN", "").strip()
+    google_sheet_id = os.getenv("GOOGLE_SHEET_ID", "").strip()
+    google_credentials_file = os.getenv("GOOGLE_CREDENTIALS_FILE", "").strip()
+
+    missing = [
+        name
+        for name, value in {
+            "BOT_TOKEN": bot_token,
+            "GOOGLE_SHEET_ID": google_sheet_id,
+            "GOOGLE_CREDENTIALS_FILE": google_credentials_file,
+        }.items()
+        if not value
+    ]
+    if missing:
+        joined = ", ".join(missing)
+        raise RuntimeError(f"Missing required environment variables: {joined}")
+
+    return Config(
+        bot_token=bot_token,
+        google_sheet_id=google_sheet_id,
+        google_credentials_file=google_credentials_file,
+        timezone=os.getenv("TIMEZONE", "Asia/Tashkent").strip() or "Asia/Tashkent",
+        allowed_user_ids=_parse_allowed_user_ids(os.getenv("ALLOWED_USER_IDS", "")),
+    )
