@@ -1,4 +1,5 @@
 from collections.abc import Sequence
+import json
 
 import gspread
 from gspread import Spreadsheet, Worksheet
@@ -22,7 +23,7 @@ OPERATIONS_HEADERS = [
 class GoogleSheetsClient:
     def __init__(self, config: Config) -> None:
         self._config = config
-        self._client = gspread.service_account(filename=config.google_credentials_file)
+        self._client = _create_gspread_client(config)
         self._spreadsheet: Spreadsheet = self._client.open_by_key(config.google_sheet_id)
         self._worksheets: dict[str, Worksheet] = {}
 
@@ -93,6 +94,20 @@ def _user_sheet_title(user_nickname: str) -> str:
     safe_nickname = "".join("_" if char in "[]:*?/\\" else char for char in normalized)
     title = f"Подотчет {safe_nickname}"
     return title[:100]
+
+
+def _create_gspread_client(config: Config) -> gspread.Client:
+    if config.google_credentials_json:
+        try:
+            credentials = json.loads(config.google_credentials_json)
+        except json.JSONDecodeError as error:
+            raise RuntimeError("GOOGLE_CREDENTIALS_JSON contains invalid JSON.") from error
+        return gspread.service_account_from_dict(credentials)
+
+    if config.google_credentials_file:
+        return gspread.service_account(filename=config.google_credentials_file)
+
+    raise RuntimeError("Google credentials are not configured.")
 
 
 def _operation_delta(operation: Operation) -> float:

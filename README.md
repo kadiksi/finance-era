@@ -57,6 +57,16 @@ TIMEZONE=Asia/Tashkent
 ALLOWED_USER_IDS=
 ```
 
+Для Railway вместо файла используйте переменную `GOOGLE_CREDENTIALS_JSON`:
+
+```env
+BOT_TOKEN=your_telegram_bot_token
+GOOGLE_SHEET_ID=your_google_sheet_id
+GOOGLE_CREDENTIALS_JSON={"type":"service_account",...}
+TIMEZONE=Asia/Tashkent
+ALLOWED_USER_IDS=
+```
+
 Запустите бота одной командой:
 
 ```bash
