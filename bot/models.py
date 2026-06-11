@@ -18,10 +18,11 @@ OPERATION_LABELS: dict[OperationType, str] = {
 @dataclass(slots=True)
 class Operation:
     operation_type: OperationType
-    project: str
+    group: str
+    purpose: str
+    comment: str
     amount: float
-    category: str
-    description: str
+    project: str
     created_at: datetime
 
     @classmethod
@@ -32,10 +33,11 @@ class Operation:
     ) -> "Operation":
         return cls(
             operation_type=OperationType(str(data["operation_type"])),
-            project=str(data["project"]),
+            group=str(data.get("group", "")),
+            purpose=str(data.get("purpose", "")),
+            comment=str(data.get("comment", "")),
             amount=float(data["amount"]),
-            category=str(data.get("category", "")),
-            description=str(data.get("description", "")),
+            project=str(data.get("project", "")),
             created_at=datetime.now(ZoneInfo(timezone)),
         )
 
@@ -47,10 +49,13 @@ class Operation:
         else:
             payout = f"-{format_amount(self.amount)}"
 
+        # Дата, Группа, Назначение платежа, Комментарий, Поступление, Выплата, Название проекта.
+        # Столбец "ОСТАТКИ факт" (8-й) заполняется в sheets.append_operation.
         return [
             self.created_at.strftime("%d.%m.%y"),
-            OPERATION_LABELS[self.operation_type],
-            self.category,
+            self.group,
+            self.purpose,
+            self.comment,
             income,
             payout,
             self.project,

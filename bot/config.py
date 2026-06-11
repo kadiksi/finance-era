@@ -12,6 +12,8 @@ class Config:
     google_credentials_json: str | None
     timezone: str
     allowed_user_ids: frozenset[int]
+    reestr_sheet_name: str
+    project_status_filter: str
 
 
 def _parse_allowed_user_ids(value: str) -> frozenset[int]:
@@ -58,4 +60,8 @@ def load_config() -> Config:
         google_credentials_json=google_credentials_json or None,
         timezone=os.getenv("TIMEZONE", "Asia/Tashkent").strip() or "Asia/Tashkent",
         allowed_user_ids=_parse_allowed_user_ids(os.getenv("ALLOWED_USER_IDS", "")),
+        reestr_sheet_name=os.getenv("REESTR_SHEET_NAME", "Реестр проектов").strip()
+        or "Реестр проектов",
+        project_status_filter=os.getenv("PROJECT_STATUS_FILTER", "в работе").strip()
+        or "в работе",
     )

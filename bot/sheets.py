@@ -12,12 +12,66 @@ from bot.models import Operation, OperationType, format_amount
 
 OPERATIONS_HEADERS = [
     "Дата",
+    "Группа",
     "Назначение платежа",
-    "Наименование",
+    "Комментарий",
     "Поступление",
     "Выплата",
     "Название проекта",
+    "ОСТАТКИ факт",
 ]
+
+# Справочник для выпадающего списка столбца "Группа".
+GROUPS = [
+    "Расходы",
+    "Заказчики",
+    "Сотрудники",
+    "Счета",
+    "Субподрядчики",
+    "Контрагенты",
+]
+
+# Справочник для выпадающего списка столбца "Назначение платежа".
+PAYMENT_PURPOSES = [
+    "Материалы",
+    "Оплата за проект",
+    "Аренда",
+    "Коммунальные услуги",
+    "Зарплата прочего персонала",
+    "Интернет, услуги связи",
+    "Внутренние переводы",
+    "Субподрядные работы",
+    "Расходы цех",
+    "Кредиты ПОЛУЧЕННЫЕ (выплата осн.долга)",
+    "Реклама",
+    "ГСМ",
+    "Зарплата рабочих",
+    "Расходы офис",
+    "HR расходы",
+    "Бонус за объекты",
+    "Транспортные услуги",
+    "Исполнение гарантийных обязательств",
+    "Представительские расходы",
+    "Возврат Инвестору",
+    "Услуги Банка",
+    "Возврат ДС Заказчику",
+    "Вывоз мусора",
+    "Транспортные расходы",
+    "Проценты с займов, кредитов ПОЛУЧЕННЫХ (выплата)",
+    "Обучение персонала",
+    "Дивиденды",
+    "Коммерческие расходы",
+    "Субподрядные работы цех",
+]
+
+# 0-based индексы столбцов с выпадающими списками.
+_GROUP_COLUMN = 1
+_PURPOSE_COLUMN = 2
+_PROJECT_COLUMN = 6
+
+# Заголовки столбцов во вкладке "Реестр проектов".
+_DEAL_HEADER = "уникальный номер сделки"
+_STATUS_HEADER = "статус работ"
 
 
 class GoogleSheetsClient:
@@ -26,41 +80,51 @@ class GoogleSheetsClient:
         self._client = _create_gspread_client(config)
         self._spreadsheet: Spreadsheet = self._client.open_by_key(config.google_sheet_id)
         self._worksheets: dict[str, Worksheet] = {}
+        self._projects_cache: list[str] | None = None
 
     def append_operation(self, operation: Operation, user_nickname: str) -> str:
         worksheet = self._ensure_user_sheet(user_nickname)
-        balance = self._get_balance(worksheet) + _operation_delta(operation)
+        balance = self._get_last_fact_balance(worksheet) + _operation_delta(operation)
+        row = operation.as_sheet_row()
+        row.append(format_amount(balance))
         worksheet.append_row(
-            operation.as_sheet_row(),
+            row,
             value_input_option="USER_ENTERED",
         )
         return format_amount(balance)
 
+    def get_groups(self) -> list[str]:
+        return list(GROUPS)
+
+    def get_payment_purposes(self) -> list[str]:
+        return list(PAYMENT_PURPOSES)
+
     def get_projects(self) -> list[str]:
-        return self._get_first_sheet_column(2, {"project", "projects", "проект"})
-
-    def get_categories(self) -> list[str]:
-        return self._get_first_sheet_column(
-            3,
-            {"category", "categories", "категория", "категории"}
-        )
-
-    def _get_first_sheet_column(self, column: int, headers: set[str]) -> list[str]:
-        worksheets = self._spreadsheet.worksheets()
-        if not worksheets:
+        """Уникальные номера сделок из 'Реестр проектов' со статусом 'в работе'."""
+        worksheet = self._get_reestr_worksheet()
+        if worksheet is None:
             return []
 
-        values = worksheets[0].col_values(column)
-        if values and values[0].strip().lower() in headers:
-            values = values[1:]
+        values = worksheet.get_all_values()
+        return _extract_deals(values, self._config.project_status_filter)
 
-        return _unique_non_empty(values)
+    def _get_reestr_worksheet(self) -> Worksheet | None:
+        try:
+            return self._spreadsheet.worksheet(self._config.reestr_sheet_name)
+        except WorksheetNotFound:
+            return None
+
+    def _projects_for_validation(self) -> list[str]:
+        if self._projects_cache is None:
+            self._projects_cache = self.get_projects()
+        return self._projects_cache
 
     def _ensure_user_sheet(self, user_nickname: str) -> Worksheet:
         title = _user_sheet_title(user_nickname)
         if title in self._worksheets:
             return self._worksheets[title]
 
+        created = False
         try:
             worksheet = self._spreadsheet.worksheet(title)
         except WorksheetNotFound:
@@ -69,24 +133,47 @@ class GoogleSheetsClient:
                 rows=1000,
                 cols=len(OPERATIONS_HEADERS),
             )
+            created = True
 
         first_row = worksheet.row_values(1)
-        if first_row != OPERATIONS_HEADERS:
+        headers_changed = first_row != OPERATIONS_HEADERS
+        if headers_changed:
             worksheet.update(values=[OPERATIONS_HEADERS], range_name="A1")
             if len(first_row) > len(OPERATIONS_HEADERS):
                 start_cell = rowcol_to_a1(1, len(OPERATIONS_HEADERS) + 1)
                 end_cell = rowcol_to_a1(1, len(first_row))
                 worksheet.batch_clear([f"{start_cell}:{end_cell}"])
 
+        if created or headers_changed:
+            self._apply_dropdowns(worksheet)
+
         self._worksheets[title] = worksheet
         return worksheet
 
-    def _get_balance(self, worksheet: Worksheet) -> float:
-        income_values = worksheet.col_values(4)[1:]
-        payout_values = worksheet.col_values(5)[1:]
-        income = sum(_parse_sheet_amount(value) for value in income_values)
-        payout = sum(_parse_sheet_amount(value) for value in payout_values)
-        return income + payout
+    def _apply_dropdowns(self, worksheet: Worksheet) -> None:
+        requests = [
+            _one_of_list_request(worksheet.id, _GROUP_COLUMN, GROUPS),
+            _one_of_list_request(worksheet.id, _PURPOSE_COLUMN, PAYMENT_PURPOSES),
+        ]
+        projects = self._projects_for_validation()
+        if projects:
+            requests.append(
+                _one_of_list_request(worksheet.id, _PROJECT_COLUMN, projects)
+            )
+        self._spreadsheet.batch_update({"requests": requests})
+
+    def _get_last_fact_balance(self, worksheet: Worksheet) -> float:
+        # Столбец H = "ОСТАТКИ факт"; берём последнее непустое значение.
+        # col_values() даёт диапазон H1:H, который API не парсит для листов с пробелом в имени.
+        rows = worksheet.get_all_values()
+        if len(rows) <= 1:
+            return 0
+
+        column_index = len(OPERATIONS_HEADERS) - 1
+        for row in reversed(rows[1:]):
+            if len(row) > column_index and row[column_index].strip():
+                return _parse_sheet_amount(row[column_index])
+        return 0
 
 
 def _user_sheet_title(user_nickname: str) -> str:
@@ -94,6 +181,68 @@ def _user_sheet_title(user_nickname: str) -> str:
     safe_nickname = "".join("_" if char in "[]:*?/\\" else char for char in normalized)
     title = f"Подотчет {safe_nickname}"
     return title[:100]
+
+
+def _one_of_list_request(
+    sheet_id: int,
+    column_index: int,
+    values: Sequence[str],
+    start_row: int = 1,
+    end_row: int = 1000,
+) -> dict:
+    return {
+        "setDataValidation": {
+            "range": {
+                "sheetId": sheet_id,
+                "startRowIndex": start_row,
+                "endRowIndex": end_row,
+                "startColumnIndex": column_index,
+                "endColumnIndex": column_index + 1,
+            },
+            "rule": {
+                "condition": {
+                    "type": "ONE_OF_LIST",
+                    "values": [{"userEnteredValue": value} for value in values],
+                },
+                "showCustomUi": True,
+                "strict": False,
+            },
+        }
+    }
+
+
+def _extract_deals(values: Sequence[Sequence[str]], status_filter: str) -> list[str]:
+    header_index = _find_header_row(values)
+    if header_index is None:
+        return []
+
+    header = [cell.strip().casefold() for cell in values[header_index]]
+    deal_col = header.index(_DEAL_HEADER)
+    status_col = header.index(_STATUS_HEADER)
+    target_status = status_filter.strip().casefold()
+
+    seen: set[str] = set()
+    result: list[str] = []
+    for row in values[header_index + 1:]:
+        if len(row) <= max(deal_col, status_col):
+            continue
+        if row[status_col].strip().casefold() != target_status:
+            continue
+        deal = row[deal_col].strip()
+        key = deal.casefold()
+        if deal and key not in seen:
+            seen.add(key)
+            result.append(deal)
+
+    return result
+
+
+def _find_header_row(values: Sequence[Sequence[str]]) -> int | None:
+    for index, row in enumerate(values[:20]):
+        normalized = {cell.strip().casefold() for cell in row}
+        if _DEAL_HEADER in normalized and _STATUS_HEADER in normalized:
+            return index
+    return None
 
 
 def _create_gspread_client(config: Config) -> gspread.Client:
@@ -129,17 +278,3 @@ def _parse_sheet_amount(value: str) -> float:
         return float(normalized)
     except ValueError:
         return 0
-
-
-def _unique_non_empty(values: Sequence[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-
-    for value in values:
-        normalized = value.strip()
-        key = normalized.casefold()
-        if normalized and key not in seen:
-            seen.add(key)
-            result.append(normalized)
-
-    return result

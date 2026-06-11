@@ -1,5 +1,7 @@
 import asyncio
+import re
 from collections.abc import Awaitable, Callable
+from difflib import SequenceMatcher
 from typing import Any
 
 from aiogram import F, Router
@@ -30,21 +32,22 @@ MENU_TO_OPERATION = {
 
 
 class OperationForm(StatesGroup):
+    choosing_group = State()
+    choosing_purpose = State()
+    entering_amount = State()
+    entering_comment = State()
     choosing_project = State()
     searching_project = State()
     entering_project = State()
-    entering_amount = State()
-    choosing_category = State()
-    entering_category = State()
-    entering_description = State()
     confirming = State()
 
 
 def create_router(
     config: Config,
     append_operation: OperationWriter,
+    load_groups: ValueLoader,
+    load_purposes: ValueLoader,
     load_projects: ValueLoader,
-    load_categories: ValueLoader,
 ) -> Router:
     router = Router()
 
@@ -70,35 +73,83 @@ def create_router(
         await state.clear()
         await state.update_data(operation_type=operation_type.value)
 
-        projects = await load_projects()
-        if projects:
-            await state.update_data(all_project_options=projects, project_options=projects)
-            await state.set_state(OperationForm.choosing_project)
-            await message.answer(
-                "Выберите проект:",
-                reply_markup=_projects_keyboard(projects),
-            )
-        else:
-            await state.set_state(OperationForm.entering_project)
-            await message.answer(
-                "Список проектов не найден. Введите название проекта текстом:",
-                reply_markup=_cancel_keyboard(),
-            )
+        groups = await load_groups()
+        await state.update_data(group_options=groups)
+        await state.set_state(OperationForm.choosing_group)
+        await message.answer(
+            "Выберите группу:",
+            reply_markup=_options_keyboard(groups, "group"),
+        )
+
+    @router.callback_query(OperationForm.choosing_group, F.data.startswith("group:"))
+    async def choose_group(callback: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        groups = list(data.get("group_options", []))
+        group = _option_by_index(groups, str(callback.data).removeprefix("group:"))
+        if group is None:
+            await callback.answer("Группа не найдена, выберите заново.", show_alert=True)
+            return
+
+        await state.update_data(group=group)
+        purposes = await load_purposes()
+        await state.update_data(purpose_options=purposes)
+        await state.set_state(OperationForm.choosing_purpose)
+        await callback.message.answer(
+            "Выберите назначение платежа:",
+            reply_markup=_options_keyboard(purposes, "purpose"),
+        )
+        await callback.answer()
+
+    @router.callback_query(OperationForm.choosing_purpose, F.data.startswith("purpose:"))
+    async def choose_purpose(callback: CallbackQuery, state: FSMContext) -> None:
+        data = await state.get_data()
+        purposes = list(data.get("purpose_options", []))
+        purpose = _option_by_index(purposes, str(callback.data).removeprefix("purpose:"))
+        if purpose is None:
+            await callback.answer("Назначение не найдено, выберите заново.", show_alert=True)
+            return
+
+        await state.update_data(purpose=purpose)
+        await state.set_state(OperationForm.entering_amount)
+        await callback.message.answer("Введите сумму:", reply_markup=_cancel_keyboard())
+        await callback.answer()
+
+    @router.message(OperationForm.entering_amount)
+    async def enter_amount(message: Message, state: FSMContext) -> None:
+        amount = _parse_amount(message.text or "")
+        if amount is None or amount <= 0:
+            await message.answer("Введите положительную сумму, например 1500 или 1500.50.")
+            return
+
+        await state.update_data(amount=amount)
+        await state.set_state(OperationForm.entering_comment)
+        await message.answer(
+            "Введите комментарий или нажмите Пропустить:",
+            reply_markup=_skip_comment_keyboard(),
+        )
+
+    @router.callback_query(OperationForm.entering_comment, F.data == "skip_comment")
+    async def skip_comment(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.update_data(comment="")
+        await _ask_project(callback.message, state, load_projects)
+        await callback.answer()
+
+    @router.message(OperationForm.entering_comment)
+    async def enter_comment(message: Message, state: FSMContext) -> None:
+        await state.update_data(comment=(message.text or "").strip())
+        await _ask_project(message, state, load_projects)
 
     @router.callback_query(OperationForm.choosing_project, F.data.startswith("project:"))
     async def choose_project(callback: CallbackQuery, state: FSMContext) -> None:
         data = await state.get_data()
         projects = list(data.get("project_options", []))
-        project_index = int(str(callback.data).removeprefix("project:"))
-        try:
-            project = projects[project_index]
-        except IndexError:
+        project = _option_by_index(projects, str(callback.data).removeprefix("project:"))
+        if project is None:
             await callback.answer("Проект не найден, выберите заново.", show_alert=True)
             return
 
         await state.update_data(project=project)
-        await state.set_state(OperationForm.entering_amount)
-        await callback.message.answer("Введите сумму:", reply_markup=_cancel_keyboard())
+        await _show_confirmation(callback.message, state)
         await callback.answer()
 
     @router.callback_query(OperationForm.choosing_project, F.data == "search_project")
@@ -136,7 +187,7 @@ def create_router(
 
         data = await state.get_data()
         projects = list(data.get("all_project_options", []))
-        matches = _filter_projects(projects, query)
+        matches = _filter_values(projects, query)
         if not matches:
             await message.answer("Проекты не найдены. Введите другой запрос или нажмите Отмена.")
             return
@@ -155,89 +206,7 @@ def create_router(
             return
 
         await state.update_data(project=message.text.strip())
-        await state.set_state(OperationForm.entering_amount)
-        await message.answer("Введите сумму:")
-
-    @router.message(OperationForm.entering_amount)
-    async def enter_amount(message: Message, state: FSMContext) -> None:
-        amount = _parse_amount(message.text or "")
-        if amount is None or amount <= 0:
-            await message.answer("Введите положительную сумму, например 1500 или 1500.50.")
-            return
-
-        await state.update_data(amount=amount)
-        data = await state.get_data()
-        operation_type = OperationType(str(data["operation_type"]))
-        if operation_type == OperationType.MANAGER_TRANSFER:
-            await state.update_data(category="")
-            await state.set_state(OperationForm.entering_description)
-            await message.answer(
-                "Введите комментарий или нажмите Пропустить:",
-                reply_markup=_skip_comment_keyboard(),
-            )
-            return
-
-        categories = await load_categories()
-        if categories:
-            await state.update_data(category_options=categories)
-            await state.set_state(OperationForm.choosing_category)
-            await message.answer(
-                "Выберите категорию:",
-                reply_markup=_categories_keyboard(categories),
-            )
-        else:
-            await state.set_state(OperationForm.entering_category)
-            await message.answer(
-                "Список категорий не найден. Введите категорию текстом:",
-                reply_markup=_cancel_keyboard(),
-            )
-
-    @router.callback_query(OperationForm.choosing_category, F.data.startswith("category:"))
-    async def choose_category(callback: CallbackQuery, state: FSMContext) -> None:
-        data = await state.get_data()
-        categories = list(data.get("category_options", []))
-        category_index = int(str(callback.data).removeprefix("category:"))
-        try:
-            category = categories[category_index]
-        except IndexError:
-            await callback.answer("Категория не найдена, выберите заново.", show_alert=True)
-            return
-
-        await state.update_data(category=category)
-        await state.set_state(OperationForm.entering_description)
-        await callback.message.answer("Введите описание или комментарий:", reply_markup=_cancel_keyboard())
-        await callback.answer()
-
-    @router.message(OperationForm.entering_category)
-    async def enter_category(message: Message, state: FSMContext) -> None:
-        if not message.text or not message.text.strip():
-            await message.answer("Введите категорию.")
-            return
-
-        await state.update_data(category=message.text.strip())
-        await state.set_state(OperationForm.entering_description)
-        await message.answer("Введите описание или комментарий:")
-
-    @router.callback_query(OperationForm.entering_description, F.data == "skip_description")
-    async def skip_description(callback: CallbackQuery, state: FSMContext) -> None:
-        await state.update_data(description="")
-        data = await state.get_data()
-        await state.set_state(OperationForm.confirming)
-        await callback.message.answer(
-            _format_confirmation(data),
-            reply_markup=_confirmation_keyboard(),
-        )
-        await callback.answer()
-
-    @router.message(OperationForm.entering_description)
-    async def enter_description(message: Message, state: FSMContext) -> None:
-        await state.update_data(description=(message.text or "").strip())
-        data = await state.get_data()
-        await state.set_state(OperationForm.confirming)
-        await message.answer(
-            _format_confirmation(data),
-            reply_markup=_confirmation_keyboard(),
-        )
+        await _show_confirmation(message, state)
 
     @router.callback_query(OperationForm.confirming, F.data == "confirm")
     async def confirm_operation(callback: CallbackQuery, state: FSMContext) -> None:
@@ -278,17 +247,56 @@ def create_router(
     return router
 
 
+async def _ask_project(
+    message: Message,
+    state: FSMContext,
+    load_projects: ValueLoader,
+) -> None:
+    projects = await load_projects()
+    if projects:
+        await state.update_data(all_project_options=projects, project_options=projects)
+        await state.set_state(OperationForm.choosing_project)
+        await message.answer(
+            "Выберите проект:",
+            reply_markup=_projects_keyboard(projects),
+        )
+    else:
+        await state.set_state(OperationForm.entering_project)
+        await message.answer(
+            "Список проектов не найден. Введите название проекта текстом:",
+            reply_markup=_cancel_keyboard(),
+        )
+
+
+async def _show_confirmation(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    await state.set_state(OperationForm.confirming)
+    await message.answer(
+        _format_confirmation(data),
+        reply_markup=_confirmation_keyboard(),
+    )
+
+
 def create_google_sheets_router(config: Config, sheets: GoogleSheetsClient) -> Router:
     async def append_operation(operation: Operation, user_nickname: str) -> str:
         return await asyncio.to_thread(sheets.append_operation, operation, user_nickname)
 
+    async def load_groups() -> list[str]:
+        return await asyncio.to_thread(sheets.get_groups)
+
+    async def load_purposes() -> list[str]:
+        return await asyncio.to_thread(sheets.get_payment_purposes)
+
     async def load_projects() -> list[str]:
         return await asyncio.to_thread(sheets.get_projects)
 
-    async def load_categories() -> list[str]:
-        return await asyncio.to_thread(sheets.get_categories)
-
-    return create_router(config, append_operation, load_projects, load_categories)
+    return create_router(
+        config,
+        append_operation,
+        load_groups,
+        load_purposes,
+        load_projects,
+    )
 
 
 def _main_menu_keyboard() -> ReplyKeyboardMarkup:
@@ -307,6 +315,15 @@ def _cancel_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
+def _options_keyboard(options: list[str], prefix: str) -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=option, callback_data=f"{prefix}:{index}")]
+        for index, option in enumerate(options[:50])
+    ]
+    buttons.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 def _projects_keyboard(projects: list[str], show_all: bool = False) -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text=project, callback_data=f"project:{index}")]
@@ -320,19 +337,10 @@ def _projects_keyboard(projects: list[str], show_all: bool = False) -> InlineKey
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def _categories_keyboard(categories: list[str]) -> InlineKeyboardMarkup:
-    buttons = [
-        [InlineKeyboardButton(text=category, callback_data=f"category:{index}")]
-        for index, category in enumerate(categories[:30])
-    ]
-    buttons.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
 def _skip_comment_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Пропустить", callback_data="skip_description")],
+            [InlineKeyboardButton(text="Пропустить", callback_data="skip_comment")],
             [InlineKeyboardButton(text="Отмена", callback_data="cancel")],
         ]
     )
@@ -354,14 +362,12 @@ def _format_confirmation(data: dict[str, Any]) -> str:
     lines = [
         "Проверьте операцию:",
         f"Тип: {OPERATION_LABELS[operation_type]}",
-        f"Проект: {data['project']}",
+        f"Группа: {data.get('group', '')}",
+        f"Назначение платежа: {data.get('purpose', '')}",
         f"Сумма: {data['amount']}",
+        f"Комментарий: {data.get('comment', '')}",
+        f"Проект: {data.get('project', '')}",
     ]
-    if operation_type == OperationType.MANAGER_EXPENSE:
-        lines.append(f"Категория: {data['category']}")
-        lines.append(f"Описание: {data['description']}")
-    else:
-        lines.append(f"Комментарий: {data['description']}")
     return "\n".join(lines)
 
 
@@ -373,13 +379,55 @@ def _parse_amount(value: str) -> float | None:
         return None
 
 
-def _filter_projects(projects: list[str], query: str) -> list[str]:
-    return _filter_values(projects, query)
+def _option_by_index(options: list[str], raw_index: str) -> str | None:
+    try:
+        return options[int(raw_index)]
+    except (ValueError, IndexError):
+        return None
+
+
+_TOKEN_RE = re.compile(r"[^0-9a-zа-яё]+", re.IGNORECASE)
+_FUZZY_THRESHOLD = 0.7
 
 
 def _filter_values(values: list[str], query: str) -> list[str]:
-    normalized_query = query.casefold()
-    return [value for value in values if normalized_query in value.casefold()]
+    normalized_query = query.strip().casefold()
+    if not normalized_query:
+        return []
+
+    # 1) Прямое вхождение подстроки — самый предсказуемый случай.
+    direct = [value for value in values if normalized_query in value.casefold()]
+    if direct:
+        return direct
+
+    # 2) Совпадение по всем токенам запроса (подстрока или похожее слово).
+    query_tokens = _tokenize(query)
+    if not query_tokens:
+        return []
+
+    matches: list[str] = []
+    for value in values:
+        candidate_text = value.casefold()
+        candidate_tokens = _tokenize(value)
+        if all(
+            _token_matches(token, candidate_text, candidate_tokens)
+            for token in query_tokens
+        ):
+            matches.append(value)
+    return matches
+
+
+def _tokenize(text: str) -> list[str]:
+    return [token for token in _TOKEN_RE.split(text.casefold()) if token]
+
+
+def _token_matches(token: str, candidate_text: str, candidate_tokens: list[str]) -> bool:
+    if token in candidate_text:
+        return True
+    return any(
+        SequenceMatcher(None, token, candidate_token).ratio() >= _FUZZY_THRESHOLD
+        for candidate_token in candidate_tokens
+    )
 
 
 def _is_allowed(user_id: int | None, config: Config) -> bool:
