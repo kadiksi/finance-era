@@ -21,6 +21,10 @@ OPERATIONS_HEADERS = [
     "ОСТАТКИ факт",
 ]
 
+_MAX_DATA_ROWS = 1000
+_REESTR_MAX_ROWS = 500
+_REESTR_MAX_COLS = 25
+
 # Справочник для выпадающего списка столбца "Группа".
 GROUPS = [
     "Расходы",
@@ -74,6 +78,10 @@ _DEAL_HEADER = "уникальный номер сделки"
 _STATUS_HEADER = "статус работ"
 
 
+def _numbered_options(options: Sequence[str]) -> list[str]:
+    return [f"{index}. {name}" for index, name in enumerate(options, start=1)]
+
+
 class GoogleSheetsClient:
     def __init__(self, config: Config) -> None:
         self._config = config
@@ -94,10 +102,10 @@ class GoogleSheetsClient:
         return format_amount(balance)
 
     def get_groups(self) -> list[str]:
-        return list(GROUPS)
+        return _numbered_options(GROUPS)
 
     def get_payment_purposes(self) -> list[str]:
-        return list(PAYMENT_PURPOSES)
+        return _numbered_options(PAYMENT_PURPOSES)
 
     def get_projects(self) -> list[str]:
         """Уникальные номера сделок из 'Реестр проектов' со статусом 'в работе'."""
@@ -105,7 +113,11 @@ class GoogleSheetsClient:
         if worksheet is None:
             return []
 
-        values = worksheet.get_all_values()
+        values = _read_sheet_range(
+            worksheet,
+            rows=_REESTR_MAX_ROWS,
+            cols=_REESTR_MAX_COLS,
+        )
         return _extract_deals(values, self._config.project_status_filter)
 
     def _get_reestr_worksheet(self) -> Worksheet | None:
@@ -152,8 +164,12 @@ class GoogleSheetsClient:
 
     def _apply_dropdowns(self, worksheet: Worksheet) -> None:
         requests = [
-            _one_of_list_request(worksheet.id, _GROUP_COLUMN, GROUPS),
-            _one_of_list_request(worksheet.id, _PURPOSE_COLUMN, PAYMENT_PURPOSES),
+            _one_of_list_request(worksheet.id, _GROUP_COLUMN, _numbered_options(GROUPS)),
+            _one_of_list_request(
+                worksheet.id,
+                _PURPOSE_COLUMN,
+                _numbered_options(PAYMENT_PURPOSES),
+            ),
         ]
         projects = self._projects_for_validation()
         if projects:
@@ -163,9 +179,7 @@ class GoogleSheetsClient:
         self._spreadsheet.batch_update({"requests": requests})
 
     def _get_last_fact_balance(self, worksheet: Worksheet) -> float:
-        # Столбец H = "ОСТАТКИ факт"; берём последнее непустое значение.
-        # col_values() даёт диапазон H1:H, который API не парсит для листов с пробелом в имени.
-        rows = worksheet.get_all_values()
+        rows = _read_sheet_range(worksheet, cols=len(OPERATIONS_HEADERS))
         if len(rows) <= 1:
             return 0
 
@@ -174,6 +188,16 @@ class GoogleSheetsClient:
             if len(row) > column_index and row[column_index].strip():
                 return _parse_sheet_amount(row[column_index])
         return 0
+
+
+def _read_sheet_range(
+    worksheet: Worksheet,
+    rows: int = _MAX_DATA_ROWS,
+    cols: int = len(OPERATIONS_HEADERS),
+) -> list[list[str]]:
+    end_cell = rowcol_to_a1(rows, cols)
+    values = worksheet.get_values(f"A1:{end_cell}")
+    return values or []
 
 
 def _user_sheet_title(user_nickname: str) -> str:

@@ -5,6 +5,7 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from aiogram import F, Router
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -91,7 +92,7 @@ def create_router(
             "<группа> <назначение> <комментарий> <сумма> <проект>\n"
             "Пример: 2 2 продажа двери 100000 373\n"
             "Номера: /справка",
-            reply_markup=_options_keyboard(groups, "group", numbered=True),
+            reply_markup=_options_keyboard(groups, "group"),
         )
 
     @router.message(OperationForm.choosing_group)
@@ -105,7 +106,7 @@ def create_router(
                 "<группа> <назначение> <комментарий> <сумма> <проект>\n"
                 "Пример: 2 2 продажа двери 100000 373\n"
                 "Номера: /справка",
-                reply_markup=_options_keyboard(groups, "group", numbered=True),
+                reply_markup=_options_keyboard(groups, "group"),
             )
             return
 
@@ -155,7 +156,7 @@ def create_router(
         await state.set_state(OperationForm.choosing_purpose)
         await callback.message.answer(
             "Выберите назначение платежа:",
-            reply_markup=_options_keyboard(purposes, "purpose", numbered=True),
+            reply_markup=_options_keyboard(purposes, "purpose"),
         )
         await callback.answer()
 
@@ -211,6 +212,12 @@ def create_router(
         await _show_confirmation(callback.message, state)
         await callback.answer()
 
+    @router.callback_query(OperationForm.choosing_project, F.data == "skip_project")
+    async def skip_project_from_list(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.update_data(project="")
+        await _show_confirmation(callback.message, state)
+        await callback.answer()
+
     @router.callback_query(OperationForm.choosing_project, F.data == "search_project")
     async def request_project_search(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(OperationForm.searching_project)
@@ -231,10 +238,19 @@ def create_router(
         )
         await callback.answer()
 
+    @router.callback_query(OperationForm.entering_project, F.data == "skip_project")
+    async def skip_project_manual(callback: CallbackQuery, state: FSMContext) -> None:
+        await state.update_data(project="")
+        await _show_confirmation(callback.message, state)
+        await callback.answer()
+
     @router.callback_query(OperationForm.choosing_project, F.data == "manual_project")
     async def request_manual_project(callback: CallbackQuery, state: FSMContext) -> None:
         await state.set_state(OperationForm.entering_project)
-        await callback.message.answer("Введите название проекта:", reply_markup=_cancel_keyboard())
+        await callback.message.answer(
+            "Введите название проекта или нажмите Пропустить:",
+            reply_markup=_skip_project_keyboard(),
+        )
         await callback.answer()
 
     @router.message(OperationForm.searching_project)
@@ -270,17 +286,47 @@ def create_router(
     @router.callback_query(OperationForm.confirming, F.data == "confirm")
     async def confirm_operation(callback: CallbackQuery, state: FSMContext) -> None:
         data = await state.get_data()
+        if data.get("submitted"):
+            await callback.answer("Операция уже сохраняется…", show_alert=True)
+            return
+
+        await state.update_data(submitted=True)
+        await state.set_state(None)
+
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramBadRequest:
+            pass
+
+        await callback.answer("Сохраняю…")
+
         operation = Operation.from_state(
             data=data,
             timezone=config.timezone,
         )
-        balance = await append_operation(operation, _telegram_nickname(callback.from_user))
+        try:
+            balance = await append_operation(
+                operation,
+                _telegram_nickname(callback.from_user),
+            )
+        except Exception:
+            await state.set_state(OperationForm.confirming)
+            await state.update_data(submitted=False)
+            await callback.message.answer(
+                "Не удалось записать операцию. Нажмите «Подтвердить» ещё раз.",
+                reply_markup=_confirmation_keyboard(),
+            )
+            return
+
         await state.clear()
         await callback.message.answer(
             f"Операция записана в Google Sheets.\nОстаток: {balance}",
             reply_markup=_main_menu_keyboard(),
         )
-        await callback.answer()
+
+    @router.callback_query(F.data == "confirm")
+    async def stale_confirm(callback: CallbackQuery) -> None:
+        await callback.answer("Эта операция уже обработана.", show_alert=True)
 
     @router.callback_query(F.data == "cancel")
     async def cancel_callback(callback: CallbackQuery, state: FSMContext) -> None:
@@ -316,14 +362,14 @@ async def _ask_project(
         await state.update_data(all_project_options=projects, project_options=projects)
         await state.set_state(OperationForm.choosing_project)
         await message.answer(
-            "Выберите проект:",
+            "Выберите проект или нажмите Пропустить:",
             reply_markup=_projects_keyboard(projects),
         )
     else:
         await state.set_state(OperationForm.entering_project)
         await message.answer(
-            "Список проектов не найден. Введите название проекта текстом:",
-            reply_markup=_cancel_keyboard(),
+            "Список проектов не найден. Введите название проекта текстом или нажмите Пропустить:",
+            reply_markup=_skip_project_keyboard(),
         )
 
 
@@ -374,18 +420,9 @@ def _cancel_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def _options_keyboard(
-    options: list[str],
-    prefix: str,
-    numbered: bool = False,
-) -> InlineKeyboardMarkup:
+def _options_keyboard(options: list[str], prefix: str) -> InlineKeyboardMarkup:
     buttons = [
-        [
-            InlineKeyboardButton(
-                text=f"{index + 1}. {option}" if numbered else option,
-                callback_data=f"{prefix}:{index}",
-            )
-        ]
+        [InlineKeyboardButton(text=option, callback_data=f"{prefix}:{index}")]
         for index, option in enumerate(options[:50])
     ]
     buttons.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
@@ -401,8 +438,18 @@ def _projects_keyboard(projects: list[str], show_all: bool = False) -> InlineKey
     if show_all:
         buttons.append([InlineKeyboardButton(text="Показать все", callback_data="show_all_projects")])
     buttons.append([InlineKeyboardButton(text="Ввести вручную", callback_data="manual_project")])
+    buttons.append([InlineKeyboardButton(text="Пропустить", callback_data="skip_project")])
     buttons.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+def _skip_project_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Пропустить", callback_data="skip_project")],
+            [InlineKeyboardButton(text="Отмена", callback_data="cancel")],
+        ]
+    )
 
 
 def _skip_comment_keyboard() -> InlineKeyboardMarkup:
@@ -433,8 +480,8 @@ def _format_confirmation(data: dict[str, Any]) -> str:
         f"Группа: {data.get('group', '')}",
         f"Назначение платежа: {data.get('purpose', '')}",
         f"Сумма: {data['amount']}",
-        f"Комментарий: {data.get('comment', '')}",
-        f"Проект: {data.get('project', '')}",
+        f"Комментарий: {data.get('comment', '') or '—'}",
+        f"Проект: {data.get('project', '') or '—'}",
     ]
     return "\n".join(lines)
 
@@ -506,10 +553,10 @@ def _format_reference(groups: list[str], purposes: list[str]) -> str:
         "",
         "Группы:",
     ]
-    lines.extend(f"  {index}. {name}" for index, name in enumerate(groups, start=1))
+    lines.extend(f"  {name}" for name in groups)
     lines.append("")
     lines.append("Назначение платежа:")
-    lines.extend(f"  {index}. {name}" for index, name in enumerate(purposes, start=1))
+    lines.extend(f"  {name}" for name in purposes)
     return "\n".join(lines)
 
 
