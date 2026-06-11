@@ -5,7 +5,7 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from aiogram import F, Router
-from aiogram.filters import CommandStart
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -63,6 +63,16 @@ def create_router(
             reply_markup=_main_menu_keyboard(),
         )
 
+    @router.message(Command("справка", "help"))
+    async def show_reference(message: Message) -> None:
+        if not _is_allowed(message.from_user.id if message.from_user else None, config):
+            await message.answer("У вас нет доступа к этому боту.")
+            return
+
+        groups = await load_groups()
+        purposes = await load_purposes()
+        await message.answer(_format_reference(groups, purposes))
+
     @router.message(F.text.in_(MENU_TO_OPERATION.keys()))
     async def start_operation(message: Message, state: FSMContext) -> None:
         if not _is_allowed(message.from_user.id if message.from_user else None, config):
@@ -77,9 +87,58 @@ def create_router(
         await state.update_data(group_options=groups)
         await state.set_state(OperationForm.choosing_group)
         await message.answer(
-            "Выберите группу:",
-            reply_markup=_options_keyboard(groups, "group"),
+            "Выберите группу кнопкой или введите быстро:\n"
+            "<группа> <назначение> <комментарий> <сумма> <проект>\n"
+            "Пример: 2 2 продажа двери 100000 373\n"
+            "Номера: /справка",
+            reply_markup=_options_keyboard(groups, "group", numbered=True),
         )
+
+    @router.message(OperationForm.choosing_group)
+    async def quick_input_or_hint(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        groups = list(data.get("group_options", []))
+        text = (message.text or "").strip()
+        if not text or not _looks_like_quick_input(text):
+            await message.answer(
+                "Выберите группу кнопкой или введите быстро:\n"
+                "<группа> <назначение> <комментарий> <сумма> <проект>\n"
+                "Пример: 2 2 продажа двери 100000 373\n"
+                "Номера: /справка",
+                reply_markup=_options_keyboard(groups, "group", numbered=True),
+            )
+            return
+
+        purposes = await load_purposes()
+        projects = await load_projects()
+
+        parsed = _parse_quick_input(text, groups, purposes)
+        if isinstance(parsed, str):
+            await message.answer(parsed)
+            return
+
+        project = _resolve_project(projects, parsed["project_query"])
+        if project is None:
+            matches = _filter_values(projects, parsed["project_query"])
+            if not matches:
+                await message.answer(f"Проект «{parsed['project_query']}» не найден.")
+            else:
+                preview = "\n".join(f"• {name}" for name in matches[:5])
+                suffix = "\n..." if len(matches) > 5 else ""
+                await message.answer(
+                    f"Проект «{parsed['project_query']}»: найдено {len(matches)}.\n"
+                    f"Уточните код:\n{preview}{suffix}"
+                )
+            return
+
+        await state.update_data(
+            group=parsed["group"],
+            purpose=parsed["purpose"],
+            comment=parsed["comment"],
+            amount=parsed["amount"],
+            project=project,
+        )
+        await _show_confirmation(message, state)
 
     @router.callback_query(OperationForm.choosing_group, F.data.startswith("group:"))
     async def choose_group(callback: CallbackQuery, state: FSMContext) -> None:
@@ -96,7 +155,7 @@ def create_router(
         await state.set_state(OperationForm.choosing_purpose)
         await callback.message.answer(
             "Выберите назначение платежа:",
-            reply_markup=_options_keyboard(purposes, "purpose"),
+            reply_markup=_options_keyboard(purposes, "purpose", numbered=True),
         )
         await callback.answer()
 
@@ -315,9 +374,18 @@ def _cancel_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def _options_keyboard(options: list[str], prefix: str) -> InlineKeyboardMarkup:
+def _options_keyboard(
+    options: list[str],
+    prefix: str,
+    numbered: bool = False,
+) -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text=option, callback_data=f"{prefix}:{index}")]
+        [
+            InlineKeyboardButton(
+                text=f"{index + 1}. {option}" if numbered else option,
+                callback_data=f"{prefix}:{index}",
+            )
+        ]
         for index, option in enumerate(options[:50])
     ]
     buttons.append([InlineKeyboardButton(text="Отмена", callback_data="cancel")])
@@ -428,6 +496,86 @@ def _token_matches(token: str, candidate_text: str, candidate_tokens: list[str])
         SequenceMatcher(None, token, candidate_token).ratio() >= _FUZZY_THRESHOLD
         for candidate_token in candidate_tokens
     )
+
+
+def _format_reference(groups: list[str], purposes: list[str]) -> str:
+    lines = [
+        "Быстрый ввод (после Пополнение или Расход):",
+        "<группа> <назначение> <комментарий> <сумма> <проект>",
+        "Пример: 2 2 продажа двери 100000 373",
+        "",
+        "Группы:",
+    ]
+    lines.extend(f"  {index}. {name}" for index, name in enumerate(groups, start=1))
+    lines.append("")
+    lines.append("Назначение платежа:")
+    lines.extend(f"  {index}. {name}" for index, name in enumerate(purposes, start=1))
+    return "\n".join(lines)
+
+
+def _looks_like_quick_input(text: str) -> bool:
+    parts = text.strip().split()
+    if len(parts) < 5:
+        return False
+    if not parts[0].isdigit() or not parts[1].isdigit():
+        return False
+    amount = _parse_amount(parts[-2])
+    return amount is not None and amount > 0 and bool(parts[-1].strip())
+
+
+def _parse_quick_input(
+    text: str,
+    groups: list[str],
+    purposes: list[str],
+) -> dict[str, Any] | str:
+    parts = text.strip().split()
+    if len(parts) < 5:
+        return "Мало параметров. Формат: <группа> <назначение> <комментарий> <сумма> <проект>"
+
+    try:
+        group_num = int(parts[0])
+        purpose_num = int(parts[1])
+    except ValueError:
+        return "Первые два параметра должны быть номерами группы и назначения."
+
+    amount = _parse_amount(parts[-2])
+    if amount is None or amount <= 0:
+        return "Сумма должна быть положительным числом."
+
+    project_query = parts[-1]
+    comment = " ".join(parts[2:-2])
+
+    if not (1 <= group_num <= len(groups)):
+        return f"Группа: укажите число от 1 до {len(groups)}."
+    if not (1 <= purpose_num <= len(purposes)):
+        return f"Назначение: укажите число от 1 до {len(purposes)}."
+
+    return {
+        "group": groups[group_num - 1],
+        "purpose": purposes[purpose_num - 1],
+        "comment": comment,
+        "amount": amount,
+        "project_query": project_query,
+    }
+
+
+def _resolve_project(projects: list[str], query: str) -> str | None:
+    matches = _filter_values(projects, query)
+    if not matches:
+        return None
+    if len(matches) == 1:
+        return matches[0]
+
+    normalized_query = query.casefold()
+    exact = [
+        project
+        for project in matches
+        if project.casefold().startswith(f"{normalized_query}.")
+        or project.split(".", 1)[0].casefold() == normalized_query
+    ]
+    if len(exact) == 1:
+        return exact[0]
+    return None
 
 
 def _is_allowed(user_id: int | None, config: Config) -> bool:
