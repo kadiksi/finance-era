@@ -3,7 +3,7 @@ import json
 
 import gspread
 from gspread import Spreadsheet, Worksheet
-from gspread.exceptions import WorksheetNotFound
+from gspread.exceptions import APIError, WorksheetNotFound
 from gspread.utils import rowcol_to_a1
 
 from bot.config import Config
@@ -90,15 +90,23 @@ class GoogleSheetsClient:
         self._projects_cache: list[str] | None = None
 
     def append_operation(self, operation: Operation, user_nickname: str) -> str:
-        worksheet = self._ensure_user_sheet(user_nickname)
-        balance = self._get_last_fact_balance(worksheet) + _operation_delta(operation)
-        row = operation.as_sheet_row()
-        row.append(format_amount(balance))
-        worksheet.append_row(
-            row,
-            value_input_option="USER_ENTERED",
-        )
-        return format_amount(balance)
+        title = _user_sheet_title(user_nickname)
+        for attempt in range(2):
+            try:
+                worksheet = self._ensure_user_sheet(user_nickname)
+                balance = self._get_last_fact_balance(worksheet) + _operation_delta(operation)
+                row = operation.as_sheet_row()
+                row.append(format_amount(balance))
+                worksheet.append_row(
+                    row,
+                    value_input_option="USER_ENTERED",
+                )
+                return format_amount(balance)
+            except APIError:
+                if attempt == 0:
+                    self._drop_user_sheet(title)
+                    continue
+                raise
 
     def get_groups(self) -> list[str]:
         return _numbered_options(GROUPS)
@@ -130,10 +138,17 @@ class GoogleSheetsClient:
             self._projects_cache = self.get_projects()
         return self._projects_cache
 
+    def _drop_user_sheet(self, title: str) -> None:
+        self._worksheets.pop(title, None)
+        self._spreadsheet = self._client.open_by_key(self._config.google_sheet_id)
+
     def _ensure_user_sheet(self, user_nickname: str) -> Worksheet:
         title = _user_sheet_title(user_nickname)
-        if title in self._worksheets:
-            return self._worksheets[title]
+        cached = self._worksheets.get(title)
+        if cached is not None:
+            if _worksheet_is_accessible(cached):
+                return cached
+            self._worksheets.pop(title, None)
 
         created = False
         try:
@@ -187,6 +202,14 @@ class GoogleSheetsClient:
             if len(row) > column_index and row[column_index].strip():
                 return _parse_sheet_amount(row[column_index])
         return 0
+
+
+def _worksheet_is_accessible(worksheet: Worksheet) -> bool:
+    try:
+        worksheet.get_values("A1")
+        return True
+    except APIError:
+        return False
 
 
 def _read_sheet_range(
