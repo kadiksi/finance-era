@@ -1,5 +1,6 @@
 from collections.abc import Sequence
 import json
+import re
 
 import gspread
 from gspread import Spreadsheet, Worksheet
@@ -25,8 +26,8 @@ _MAX_DATA_ROWS = 1000
 _REESTR_MAX_ROWS = 500
 _REESTR_MAX_COLS = 25
 
-# Справочник для выпадающего списка столбца "Группа".
-GROUPS = [
+# Справочник для выпадающего списка столбца "Группа" (начальные значения).
+DEFAULT_GROUPS = [
     "Заказчики",
     "Сотрудники",
     "Счета",
@@ -34,8 +35,8 @@ GROUPS = [
     "Контрагенты",
 ]
 
-# Справочник для выпадающего списка столбца "Назначение платежа".
-PAYMENT_PURPOSES = [
+# Справочник для выпадающего списка столбца "Назначение платежа" (начальные значения).
+DEFAULT_PAYMENT_PURPOSES = [
     "Материалы",
     "Оплата за проект",
     "Аренда",
@@ -77,8 +78,82 @@ _DEAL_HEADER = "уникальный номер сделки"
 _STATUS_HEADER = "статус работ"
 
 
+_PODOTCHET_PREFIX = "Подотчет "
+_NUMBERED_OPTION_RE = re.compile(r"^\d+\.\s*")
+# Строка 2 (1-based): validation задаётся с startRowIndex=1.
+_VALIDATION_SAMPLE_ROW = 2
+
+
 def _numbered_options(options: Sequence[str]) -> list[str]:
     return [f"{index}. {name}" for index, name in enumerate(options, start=1)]
+
+
+def _strip_option_number(value: str) -> str:
+    return _NUMBERED_OPTION_RE.sub("", value.strip())
+
+
+def _resolve_effective_list(defaults: Sequence[str], document_values: Sequence[str]) -> list[str]:
+    if not document_values:
+        return list(defaults)
+    document_raw = [_strip_option_number(value) for value in document_values]
+    if document_raw == list(defaults):
+        return list(defaults)
+    return document_raw
+
+
+def _parse_validation_values(data_validation: dict) -> list[str]:
+    condition = data_validation.get("condition", {})
+    if condition.get("type") != "ONE_OF_LIST":
+        return []
+    return [
+        value.get("userEnteredValue", "").strip()
+        for value in condition.get("values", [])
+        if value.get("userEnteredValue", "").strip()
+    ]
+
+
+def _read_cell_validation(
+    spreadsheet: Spreadsheet,
+    worksheet: Worksheet,
+    row: int,
+    column_index: int,
+) -> list[str]:
+    cell = rowcol_to_a1(row, column_index + 1)
+    title = worksheet.title.replace("'", "''")
+    range_a1 = f"'{title}'!{cell}"
+    metadata = spreadsheet.fetch_sheet_metadata(
+        params={
+            "includeGridData": "true",
+            "ranges": [range_a1],
+            "fields": "sheets.data.rowData.values.dataValidation",
+        }
+    )
+    try:
+        cell_data = metadata["sheets"][0]["data"][0]["rowData"][0]["values"][0]
+    except (KeyError, IndexError):
+        return []
+    return _parse_validation_values(cell_data.get("dataValidation", {}))
+
+
+def _read_column_validation(
+    spreadsheet: Spreadsheet,
+    worksheet: Worksheet,
+    column_index: int,
+) -> list[str]:
+    for row in (_VALIDATION_SAMPLE_ROW, 1):
+        values = _read_cell_validation(spreadsheet, worksheet, row, column_index)
+        if values:
+            return values
+    return []
+
+
+def _is_podotchet_worksheet(worksheet: Worksheet) -> bool:
+    if not worksheet.title.startswith(_PODOTCHET_PREFIX):
+        return False
+    try:
+        return worksheet.row_values(1) == OPERATIONS_HEADERS
+    except APIError:
+        return False
 
 
 class GoogleSheetsClient:
@@ -108,11 +183,11 @@ class GoogleSheetsClient:
                     continue
                 raise
 
-    def get_groups(self) -> list[str]:
-        return _numbered_options(GROUPS)
+    def get_groups(self, user_nickname: str | None = None) -> list[str]:
+        return _numbered_options(self._effective_groups(user_nickname))
 
-    def get_payment_purposes(self) -> list[str]:
-        return _numbered_options(PAYMENT_PURPOSES)
+    def get_payment_purposes(self, user_nickname: str | None = None) -> list[str]:
+        return _numbered_options(self._effective_purposes(user_nickname))
 
     def get_projects(self) -> list[str]:
         """Уникальные номера сделок из 'Реестр проектов' со статусом 'в работе'."""
@@ -141,6 +216,40 @@ class GoogleSheetsClient:
     def _drop_user_sheet(self, title: str) -> None:
         self._worksheets.pop(title, None)
         self._spreadsheet = self._client.open_by_key(self._config.google_sheet_id)
+
+    def _find_podotchet_worksheet(self, user_nickname: str | None = None) -> Worksheet | None:
+        if user_nickname:
+            title = _user_sheet_title(user_nickname)
+            try:
+                worksheet = self._spreadsheet.worksheet(title)
+            except WorksheetNotFound:
+                pass
+            else:
+                if _is_podotchet_worksheet(worksheet):
+                    return worksheet
+
+        for worksheet in self._spreadsheet.worksheets():
+            if _is_podotchet_worksheet(worksheet):
+                return worksheet
+        return None
+
+    def _effective_groups(self, user_nickname: str | None = None) -> list[str]:
+        document_values = self._read_reference_validation(_GROUP_COLUMN, user_nickname)
+        return _resolve_effective_list(DEFAULT_GROUPS, document_values)
+
+    def _effective_purposes(self, user_nickname: str | None = None) -> list[str]:
+        document_values = self._read_reference_validation(_PURPOSE_COLUMN, user_nickname)
+        return _resolve_effective_list(DEFAULT_PAYMENT_PURPOSES, document_values)
+
+    def _read_reference_validation(
+        self,
+        column_index: int,
+        user_nickname: str | None = None,
+    ) -> list[str]:
+        worksheet = self._find_podotchet_worksheet(user_nickname)
+        if worksheet is None:
+            return []
+        return _read_column_validation(self._spreadsheet, worksheet, column_index)
 
     def _ensure_user_sheet(self, user_nickname: str) -> Worksheet:
         title = _user_sheet_title(user_nickname)
@@ -171,18 +280,22 @@ class GoogleSheetsClient:
                 worksheet.batch_clear([f"{start_cell}:{end_cell}"])
 
         if created or headers_changed:
-            self._apply_dropdowns(worksheet)
+            self._apply_dropdowns(worksheet, user_nickname)
 
         self._worksheets[title] = worksheet
         return worksheet
 
-    def _apply_dropdowns(self, worksheet: Worksheet) -> None:
+    def _apply_dropdowns(self, worksheet: Worksheet, user_nickname: str) -> None:
         requests = [
-            _one_of_list_request(worksheet.id, _GROUP_COLUMN, _numbered_options(GROUPS)),
+            _one_of_list_request(
+                worksheet.id,
+                _GROUP_COLUMN,
+                _numbered_options(self._effective_groups(user_nickname)),
+            ),
             _one_of_list_request(
                 worksheet.id,
                 _PURPOSE_COLUMN,
-                _numbered_options(PAYMENT_PURPOSES),
+                _numbered_options(self._effective_purposes(user_nickname)),
             ),
         ]
         projects = self._projects_for_validation()

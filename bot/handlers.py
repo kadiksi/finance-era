@@ -24,7 +24,7 @@ from bot.sheets import GoogleSheetsClient
 
 
 OperationWriter = Callable[[Operation, str], Awaitable[str]]
-ValueLoader = Callable[[], Awaitable[list[str]]]
+ValueLoader = Callable[[str | None], Awaitable[list[str]]]
 
 MENU_TO_OPERATION = {
     "Пополнение": OperationType.MANAGER_TRANSFER,
@@ -70,8 +70,9 @@ def create_router(
             await message.answer("У вас нет доступа к этому боту.")
             return
 
-        groups = await load_groups()
-        purposes = await load_purposes()
+        nickname = _telegram_nickname(message.from_user)
+        groups = await load_groups(nickname)
+        purposes = await load_purposes(nickname)
         await message.answer(_format_reference(groups, purposes))
 
     @router.message(F.text.in_(MENU_TO_OPERATION.keys()))
@@ -84,7 +85,8 @@ def create_router(
         await state.clear()
         await state.update_data(operation_type=operation_type.value)
 
-        groups = await load_groups()
+        nickname = _telegram_nickname(message.from_user)
+        groups = await load_groups(nickname)
         await state.update_data(group_options=groups)
         await state.set_state(OperationForm.choosing_group)
         await message.answer(
@@ -110,7 +112,8 @@ def create_router(
             )
             return
 
-        purposes = await load_purposes()
+        nickname = _telegram_nickname(message.from_user)
+        purposes = await load_purposes(nickname)
         projects = await load_projects()
 
         parsed = _parse_quick_input(text, groups, purposes)
@@ -151,7 +154,8 @@ def create_router(
             return
 
         await state.update_data(group=group)
-        purposes = await load_purposes()
+        nickname = _telegram_nickname(callback.from_user)
+        purposes = await load_purposes(nickname)
         await state.update_data(purpose_options=purposes)
         await state.set_state(OperationForm.choosing_purpose)
         await callback.message.answer(
@@ -386,11 +390,11 @@ def create_google_sheets_router(config: Config, sheets: GoogleSheetsClient) -> R
     async def append_operation(operation: Operation, user_nickname: str) -> str:
         return await asyncio.to_thread(sheets.append_operation, operation, user_nickname)
 
-    async def load_groups() -> list[str]:
-        return await asyncio.to_thread(sheets.get_groups)
+    async def load_groups(nickname: str | None) -> list[str]:
+        return await asyncio.to_thread(sheets.get_groups, nickname)
 
-    async def load_purposes() -> list[str]:
-        return await asyncio.to_thread(sheets.get_payment_purposes)
+    async def load_purposes(nickname: str | None) -> list[str]:
+        return await asyncio.to_thread(sheets.get_payment_purposes, nickname)
 
     async def load_projects() -> list[str]:
         return await asyncio.to_thread(sheets.get_projects)
