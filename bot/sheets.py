@@ -99,7 +99,15 @@ def _resolve_effective_list(defaults: Sequence[str], document_values: Sequence[s
     document_raw = [_strip_option_number(value) for value in document_values]
     if document_raw == list(defaults):
         return list(defaults)
-    return document_raw
+
+    merged = list(defaults)
+    known = {item.casefold() for item in merged}
+    for item in document_raw:
+        key = item.casefold()
+        if key not in known:
+            merged.append(item)
+            known.add(key)
+    return merged
 
 
 def _parse_validation_values(data_validation: dict) -> list[str]:
