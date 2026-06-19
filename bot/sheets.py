@@ -171,7 +171,6 @@ class GoogleSheetsClient:
         self._client = _create_gspread_client(config)
         self._spreadsheet: Spreadsheet = self._client.open_by_key(config.google_sheet_id)
         self._worksheets: dict[str, Worksheet] = {}
-        self._projects_cache: list[str] | None = None
 
     def append_operation(self, operation: Operation, user_nickname: str) -> str:
         title = _user_sheet_title(user_nickname)
@@ -200,6 +199,7 @@ class GoogleSheetsClient:
 
     def get_projects(self) -> list[str]:
         """Уникальные номера сделок из 'Реестр проектов' со статусом 'в работе'."""
+        self._refresh_spreadsheet()
         worksheet = self._get_reestr_worksheet()
         if worksheet is None:
             return []
@@ -211,6 +211,9 @@ class GoogleSheetsClient:
         )
         return _extract_deals(values, self._config.project_status_filter)
 
+    def _refresh_spreadsheet(self) -> None:
+        self._spreadsheet = self._client.open_by_key(self._config.google_sheet_id)
+
     def _get_reestr_worksheet(self) -> Worksheet | None:
         try:
             return self._spreadsheet.worksheet(self._config.reestr_sheet_name)
@@ -218,13 +221,11 @@ class GoogleSheetsClient:
             return None
 
     def _projects_for_validation(self) -> list[str]:
-        if self._projects_cache is None:
-            self._projects_cache = self.get_projects()
-        return self._projects_cache
+        return self.get_projects()
 
     def _drop_user_sheet(self, title: str) -> None:
         self._worksheets.pop(title, None)
-        self._spreadsheet = self._client.open_by_key(self._config.google_sheet_id)
+        self._refresh_spreadsheet()
 
     def _find_podotchet_worksheet(self, user_nickname: str | None = None) -> Worksheet | None:
         if user_nickname:

@@ -233,9 +233,8 @@ def create_router(
 
     @router.callback_query(OperationForm.choosing_project, F.data == "show_all_projects")
     async def show_all_projects(callback: CallbackQuery, state: FSMContext) -> None:
-        data = await state.get_data()
-        projects = list(data.get("all_project_options", []))
-        await state.update_data(project_options=projects)
+        projects = await load_projects()
+        await state.update_data(all_project_options=projects, project_options=projects)
         await callback.message.answer(
             "Выберите проект:",
             reply_markup=_projects_keyboard(projects),
@@ -264,14 +263,13 @@ def create_router(
             await message.answer("Введите непустой запрос для поиска.")
             return
 
-        data = await state.get_data()
-        projects = list(data.get("all_project_options", []))
+        projects = await load_projects()
         matches = _filter_values(projects, query)
         if not matches:
             await message.answer("Проекты не найдены. Введите другой запрос или нажмите Отмена.")
             return
 
-        await state.update_data(project_options=matches)
+        await state.update_data(all_project_options=projects, project_options=matches)
         await state.set_state(OperationForm.choosing_project)
         await message.answer(
             "Найденные проекты:",
