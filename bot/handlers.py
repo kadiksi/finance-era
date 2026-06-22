@@ -25,6 +25,7 @@ from bot.sheets import GoogleSheetsClient
 
 OperationWriter = Callable[[Operation, str], Awaitable[str]]
 ValueLoader = Callable[[str | None], Awaitable[list[str]]]
+ProjectLoader = Callable[[], Awaitable[list[str]]]
 
 MENU_TO_OPERATION = {
     "Пополнение": OperationType.MANAGER_TRANSFER,
@@ -48,7 +49,7 @@ def create_router(
     append_operation: OperationWriter,
     load_groups: ValueLoader,
     load_purposes: ValueLoader,
-    load_projects: ValueLoader,
+    load_projects: ProjectLoader,
 ) -> Router:
     router = Router()
 
@@ -87,6 +88,7 @@ def create_router(
 
         nickname = _telegram_nickname(message.from_user)
         groups = await load_groups(nickname)
+        await _refresh_project_options(state, load_projects)
         await state.update_data(group_options=groups)
         await state.set_state(OperationForm.choosing_group)
         await message.answer(
@@ -114,7 +116,7 @@ def create_router(
 
         nickname = _telegram_nickname(message.from_user)
         purposes = await load_purposes(nickname)
-        projects = await load_projects()
+        projects = await _refresh_project_options(state, load_projects)
 
         parsed = _parse_quick_input(text, groups, purposes)
         if isinstance(parsed, str):
@@ -209,7 +211,12 @@ def create_router(
         projects = list(data.get("project_options", []))
         project = _option_by_index(projects, str(callback.data).removeprefix("project:"))
         if project is None:
-            await callback.answer("Проект не найден, выберите заново.", show_alert=True)
+            projects = await _refresh_project_options(state, load_projects)
+            await callback.answer("Проект не найден. Список обновлён — выберите заново.", show_alert=True)
+            await callback.message.answer(
+                "Выберите проект или нажмите Пропустить:",
+                reply_markup=_projects_keyboard(projects),
+            )
             return
 
         await state.update_data(project=project)
@@ -224,6 +231,7 @@ def create_router(
 
     @router.callback_query(OperationForm.choosing_project, F.data == "search_project")
     async def request_project_search(callback: CallbackQuery, state: FSMContext) -> None:
+        await _refresh_project_options(state, load_projects)
         await state.set_state(OperationForm.searching_project)
         await callback.message.answer(
             "Введите часть названия проекта для поиска:",
@@ -233,8 +241,7 @@ def create_router(
 
     @router.callback_query(OperationForm.choosing_project, F.data == "show_all_projects")
     async def show_all_projects(callback: CallbackQuery, state: FSMContext) -> None:
-        projects = await load_projects()
-        await state.update_data(all_project_options=projects, project_options=projects)
+        projects = await _refresh_project_options(state, load_projects)
         await callback.message.answer(
             "Выберите проект:",
             reply_markup=_projects_keyboard(projects),
@@ -263,13 +270,13 @@ def create_router(
             await message.answer("Введите непустой запрос для поиска.")
             return
 
-        projects = await load_projects()
+        projects = await _refresh_project_options(state, load_projects)
         matches = _filter_values(projects, query)
         if not matches:
             await message.answer("Проекты не найдены. Введите другой запрос или нажмите Отмена.")
             return
 
-        await state.update_data(all_project_options=projects, project_options=matches)
+        await state.update_data(project_options=matches)
         await state.set_state(OperationForm.choosing_project)
         await message.answer(
             "Найденные проекты:",
@@ -354,14 +361,22 @@ def create_router(
     return router
 
 
+async def _refresh_project_options(
+    state: FSMContext,
+    load_projects: ProjectLoader,
+) -> list[str]:
+    projects = await load_projects()
+    await state.update_data(all_project_options=projects, project_options=projects)
+    return projects
+
+
 async def _ask_project(
     message: Message,
     state: FSMContext,
-    load_projects: ValueLoader,
+    load_projects: ProjectLoader,
 ) -> None:
-    projects = await load_projects()
+    projects = await _refresh_project_options(state, load_projects)
     if projects:
-        await state.update_data(all_project_options=projects, project_options=projects)
         await state.set_state(OperationForm.choosing_project)
         await message.answer(
             "Выберите проект или нажмите Пропустить:",
